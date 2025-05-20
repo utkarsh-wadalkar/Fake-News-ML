@@ -1,30 +1,19 @@
-import pandas as pd
-import numpy as np
-import re
-from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-import streamlit as st 
+from flask import Flask, render_template, request, jsonify
+import re  # for cleaning
+import pickle
+from flask_cors import CORS
 
-# Load datasets
-real = pd.read_csv('True.csv')
-fake = pd.read_csv('Fake.csv')
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
-# Label the datasets
-real['label'] = 1
-fake['label'] = 0
+# Load the trained models and vectorizer
+with open('model.pkl', 'rb') as f:
+    model_data = pickle.load(f)
 
-# Combine datasets
-news = pd.concat([real, fake], axis=0)
-
-# Drop unnecessary columns
-news = news.drop(['title', 'subject', 'date'], axis=1)
-
-# Shuffle the dataset
-news = news.sample(frac=1).reset_index(drop=True)
+lr_model = model_data['lr']
+gbc_model = model_data['gbc']
+rfc_model = model_data['rfc']
+vectorizer = model_data['vectorizer']
 
 # Text cleaning function
 def cleantext(text):
@@ -36,67 +25,70 @@ def cleantext(text):
     text = re.sub(r'\n', ' ', text)
     return text
 
-# Apply text cleaning
-news['text'] = news['text'].apply(cleantext)
+# Route to serve the homepage
+@app.route('/')
+def home():
+    return render_template('index.html')
 
-# Split data into features and labels
-x = news['text']
-y = news['label']
+# Route to handle news verification with single model (RFC)
+@app.route('/verify', methods=['POST'])
+def verify():
+    data = request.get_json()
+    news_text = data.get('news_text', '')
+    if not news_text:
+        return jsonify({'error': 'No news text provided'}), 400
 
-# Train-test split
-x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.3)
+    cleaned_text = cleantext(news_text)
 
-# Vectorization
-vectorfunc = TfidfVectorizer()
-xv_train = vectorfunc.fit_transform(x_train)
-xv_test = vectorfunc.transform(x_test)
+    # Use loaded vectorizer to transform input
+    vectorized_text = vectorizer.transform([cleaned_text])
 
-# Logistic Regression model
-LR = LogisticRegression()
-LR.fit(xv_train, y_train)
-pred_lr = LR.predict(xv_test)
-print("Logistic Regression Score:", LR.score(xv_test, y_test))
-print(classification_report(y_test, pred_lr))
+    # Predict using RFC model
+    prediction = rfc_model.predict(vectorized_text)[0]
 
-# Decision Tree Classifier
-DCT = DecisionTreeClassifier()
-DCT.fit(xv_train, y_train)
-pred_dct = DCT.predict(xv_test)
-print("Decision Tree Score:", DCT.score(xv_test, y_test))
-print(classification_report(y_test, pred_dct))
+    # For confidence, if model supports predict_proba
+    confidence = None
+    if hasattr(rfc_model, 'predict_proba'):
+        proba = rfc_model.predict_proba(vectorized_text)[0]
+        confidence = round(max(proba) * 100, 2)
 
-# Random Forest Classifier
-rfc = RandomForestClassifier()
-rfc.fit(xv_train, y_train)
-pred_rfc = rfc.predict(xv_test)
-print("Random Forest Score:", rfc.score(xv_test, y_test))
-print(classification_report(y_test, pred_rfc))
+    # Prepare response
+    pred_label = 'Fake' if prediction == 0 else 'Real'
+    explanation = ''
+    if pred_label == 'Fake':
+        explanation = 'This news contains patterns commonly found in misinformation campaigns.'
+    else:
+        explanation = 'This news appears to be from credible sources and follows factual patterns.'
 
-# Gradient Boosting Classifier
-# gbc = GradientBoostingClassifier()
-# gbc.fit(xv_train, y_train)
-# pred_gbc = gbc.predict(xv_test)
-# print("Gradient Boosting Score:", gbc.score(xv_test, y_test))
-# print(classification_report(y_test, pred_gbc))
+    return jsonify({
+        'prediction': pred_label,
+        'confidence': confidence,
+        'explanation': explanation
+    })
 
-# Function to output label
-def output_label(n):
-    return "Genuine News" if n == 1 else "Fake News"
+# Renamed route function to avoid endpoint conflict
+@app.route('/manual_test', methods=['POST'])
+def manual_test_route():
+    data = request.get_json()
+    news_text = data.get('news_text', '')
+    if not news_text:
+        return jsonify({'error': 'No news text provided'}), 400
 
-# Manual Testing function
-def manual_testing(news):
-    testing_news = {"text": [news]}
-    new_test = pd.DataFrame(testing_news)
-    new_test["text"] = new_test["text"].apply(cleantext)
-    new_xv_test = vectorfunc.transform(new_test["text"])
-    pred_lr = LR.predict(new_xv_test)
-    #pred_gbc = gbc.predict(new_xv_test)
-    pred_rfc = rfc.predict(new_xv_test)
-    return f" \n LR Prediction: {output_label(pred_lr[0])} \n RFC Prediction: {output_label(pred_rfc[0])}"
+    cleaned_text = cleantext(news_text)
+    vectorized_text = vectorizer.transform([cleaned_text])
 
-# Streamlit app
-import streamlit as st
-st.title("Fake News Detector")
-news_input = st.text_input("Enter news article")
-if st.button("Check News"):
-    st.write(manual_testing(news_input))
+    pred_lr = lr_model.predict(vectorized_text)[0]
+    pred_gbc = gbc_model.predict(vectorized_text)[0]
+    pred_rfc = rfc_model.predict(vectorized_text)[0]
+
+    def output_label(n):
+        return "Fake News" if n == 0 else "Real News"
+
+    return jsonify({
+        'LR_Prediction': output_label(pred_lr),
+        'GBC_Prediction': output_label(pred_gbc),
+        'RFC_Prediction': output_label(pred_rfc)
+    })
+
+if __name__ == '__main__':
+    app.run(debug=True)
